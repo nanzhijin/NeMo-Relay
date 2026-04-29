@@ -85,31 +85,16 @@ Before you create a release tag, confirm the following:
    public API changes that belong in the release.
 3. The working tree you use for local validation is clean or disposable.
 4. Registry credentials and repository settings are in place:
-   - `CARGO_REGISTRY_TOKEN` for crates.io publishing when
-     `NEMO_FLOW_ENABLE_TRUSTED_PUBLISHING` is not enabled
-   - `PYPI_API_TOKEN` for PyPI publishing when
-     `NEMO_FLOW_ENABLE_PYTHON_TRUSTED_PUBLISHING` is not enabled
-   - GitHub Actions `id-token: write` access for the top-level crates.io
-     publish job when
-     `NEMO_FLOW_ENABLE_TRUSTED_PUBLISHING=true`
-   - GitHub Actions `id-token: write` access is available for the top-level npm
-     publish job
-   - npm trusted publishers for `nemo-flow-node` and `nemo-flow-wasm` are
-     configured for the top-level
-     [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) workflow
+   - `CARGO_REGISTRY_TOKEN` for crates.io publishing when `NEMO_FLOW_ENABLE_TRUSTED_PUBLISHING` is not enabled
+   - GitHub Actions `id-token: write` access for the top-level crates.io publish job when `NEMO_FLOW_ENABLE_TRUSTED_PUBLISHING=true`
+   - GitHub Actions `id-token: write` access is available for the top-level npm publish job
+   - npm trusted publishers for `nemo-flow-node` and `nemo-flow-wasm` are configured for the top-level [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) workflow
    - GitHub Actions `id-token: write` access for the top-level PyPI publish job
-     when `NEMO_FLOW_ENABLE_PYTHON_TRUSTED_PUBLISHING=true`
 5. The repository variable `NEMO_FLOW_ENABLE_TRUSTED_PUBLISHING` matches the
    intended crates.io auth path for this release:
    - `true` uses GitHub OIDC plus `rust-lang/crates-io-auth-action`
    - `false` uses the `CARGO_REGISTRY_TOKEN` secret
-6. The repository variable `NEMO_FLOW_ENABLE_PYTHON_TRUSTED_PUBLISHING`
-   matches the intended PyPI auth path for this release:
-   - `true` uses PyPI trusted publishing from the top-level
-     [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) workflow
-   - `false` uses the `PYPI_API_TOKEN` secret from the top-level
-     [`.github/workflows/ci.yaml`](.github/workflows/ci.yaml) workflow
-7. The GitHub Release entry is ready to become the only canonical release-notes
+6. The GitHub Release entry is ready to become the only canonical release-notes
    surface.
 
 ## Prepare The Release Commit
@@ -202,12 +187,8 @@ The release pipeline then:
      `nemo-flow-ffi`
      through either trusted publishing or `CARGO_REGISTRY_TOKEN`, depending on
      `NEMO_FLOW_ENABLE_TRUSTED_PUBLISHING`
-   - `publish-python` uploads the wheel artifacts to PyPI and uses one of two
-     auth paths:
-     - trusted publishing from the top-level workflow when
-       `NEMO_FLOW_ENABLE_PYTHON_TRUSTED_PUBLISHING=true`
-     - `PYPI_API_TOKEN` from the top-level workflow when
-       `NEMO_FLOW_ENABLE_PYTHON_TRUSTED_PUBLISHING=false`
+   - `publish-python` uploads the wheel artifacts to PyPI with trusted
+     publishing from the top-level workflow
    - `publish-npm` publishes the Node.js and WASM npm packages through npm
      trusted publishing from the top-level workflow
      - stable tags publish to the npm `latest` dist-tag
