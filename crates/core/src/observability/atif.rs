@@ -38,6 +38,7 @@ use uuid::Uuid;
 use crate::api::event::Event;
 use crate::api::runtime::EventSubscriberFn;
 use crate::api::subscriber::flush_subscribers;
+use crate::codec::response::{Usage, estimate_cost_for_provider};
 use crate::error::Result;
 use crate::json::Json;
 
@@ -648,10 +649,16 @@ fn collect_openai_responses_content_text(
 /// Known keys in token_usage that we extract to dedicated fields.
 const TOKEN_USAGE_KNOWN_KEYS: &[&str] = &[
     "prompt_tokens",
+    "input_tokens",
     "completion_tokens",
+    "output_tokens",
     "cached_tokens",
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_write_tokens",
     "cost_usd",
     "cost",
+    "prompt_tokens_details",
     "prompt_token_ids",
     "completion_token_ids",
     "logprobs",
@@ -662,23 +669,48 @@ const TOKEN_USAGE_KNOWN_KEYS: &[&str] = &[
 /// Supports NeMo Relay `token_usage` and provider-native `usage` payloads.
 /// Populates `extra` with any unknown usage keys (e.g. reasoning_tokens or total_tokens).
 /// Returns `None` if the response has no recognized token or cost metrics.
-fn extract_metrics(output: &Json) -> Option<AtifMetrics> {
+fn extract_metrics(
+    output: &Json,
+    provider: Option<&str>,
+    model_name: Option<&str>,
+) -> Option<AtifMetrics> {
     let usage = token_usage_object(output)?;
     let prompt = usage_u64(usage, &["prompt_tokens", "input_tokens"]);
     let completion = usage_u64(usage, &["completion_tokens", "output_tokens"]);
-    let cached = usage_u64(usage, &["cached_tokens"])
+    let cache_read = usage_u64(usage, &["cached_tokens"])
         .or_else(|| prompt_tokens_detail_u64(usage, "cached_tokens"))
         .or_else(|| input_tokens_detail_u64(usage, "cached_tokens"))
-        .or_else(|| {
-            sum_usage_u64(
-                usage,
-                &["cache_read_input_tokens", "cache_creation_input_tokens"],
-            )
-        });
-    let cost = usage
+        .or_else(|| usage_u64(usage, &["cache_read_input_tokens"]));
+    let cache_write = usage_u64(
+        usage,
+        &["cache_creation_input_tokens", "cache_write_tokens"],
+    );
+    let cached = sum_options(cache_read, cache_write);
+    let explicit_cost = usage
         .get("cost_usd")
         .and_then(Json::as_f64)
-        .or_else(|| usage.get("cost")?.as_object()?.get("total")?.as_f64());
+        .or_else(|| usage.get("cost").and_then(cost_usd_from_cost_object));
+    let has_reported_cost = usage.get("cost").is_some();
+    let cost = if has_reported_cost {
+        explicit_cost
+    } else {
+        explicit_cost.or_else(|| {
+            let model_name = model_name.or_else(|| response_model_name(output))?;
+            estimate_cost_for_provider(
+                provider,
+                model_name,
+                &Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_tokens: usage_u64(usage, &["total_tokens"]),
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
+                    cost: None,
+                },
+            )
+            .and_then(|cost| cost.total_for_currency("USD"))
+        })
+    };
     let prompt_ids = usage
         .get("prompt_token_ids")
         .and_then(Json::as_array)
@@ -714,6 +746,30 @@ fn extract_metrics(output: &Json) -> Option<AtifMetrics> {
         completion_token_ids: completion_ids,
         logprobs,
         extra,
+    })
+}
+
+fn cost_usd_from_cost_object(cost: &Json) -> Option<f64> {
+    let cost = cost.as_object()?;
+    let currency = cost.get("currency").and_then(Json::as_str);
+    let is_relay_normalized_cost = cost
+        .get("source")
+        .and_then(Json::as_str)
+        .is_some_and(|source| matches!(source, "provider_reported" | "model_pricing"));
+    let has_legacy_provider_total =
+        currency.is_none() && cost.get("total").and_then(Json::as_f64).is_some();
+    let is_usd_cost = currency.is_some_and(|currency| currency.eq_ignore_ascii_case("USD"))
+        || currency.is_none() && (is_relay_normalized_cost || has_legacy_provider_total);
+    if !is_usd_cost {
+        return None;
+    }
+
+    cost.get("total").and_then(Json::as_f64).or_else(|| {
+        let (has_component, component_total) = ["input", "output", "cache_read", "cache_write"]
+            .iter()
+            .filter_map(|field| cost.get(*field).and_then(Json::as_f64))
+            .fold((false, 0.0), |(_, total), value| (true, total + value));
+        has_component.then_some(component_total)
     })
 }
 
@@ -787,16 +843,18 @@ fn usage_u64(usage: &serde_json::Map<String, Json>, keys: &[&str]) -> Option<u64
         .find_map(|key| usage.get(*key).and_then(Json::as_u64))
 }
 
-fn sum_usage_u64(usage: &serde_json::Map<String, Json>, keys: &[&str]) -> Option<u64> {
-    let mut total = 0;
-    let mut found = false;
-    for key in keys {
-        if let Some(value) = usage.get(*key).and_then(Json::as_u64) {
-            total += value;
-            found = true;
-        }
+fn response_model_name(output: &Json) -> Option<&str> {
+    output
+        .as_object()
+        .and_then(|object| object.get("model").and_then(Json::as_str))
+}
+
+fn sum_options(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left + right),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
     }
-    found.then_some(total)
 }
 
 fn prompt_tokens_detail_u64(usage: &serde_json::Map<String, Json>, key: &str) -> Option<u64> {
@@ -1349,7 +1407,9 @@ impl LlmSpanCandidate {
                 .or_else(|| end.model_name())
                 .map(ToOwned::to_owned),
             fidelity_score: llm_event_fidelity_score(start).max(llm_event_fidelity_score(end)),
-            end_metrics: end.data().and_then(extract_metrics),
+            end_metrics: end
+                .data()
+                .and_then(|output| extract_metrics(output, Some(end.name()), end.model_name())),
             hook_instrumentation: is_hook_instrumented_llm_event(start)
                 || is_hook_instrumented_llm_event(end),
             gateway_instrumentation: is_gateway_instrumented_llm_event(start)
@@ -2168,7 +2228,7 @@ impl StepConversionState {
         );
 
         let metrics = merge_metrics(
-            extract_metrics(output),
+            extract_metrics(output, Some(event.name()), event.model_name()),
             lookups.supplemental_llm_metrics.get(&event.uuid()),
         );
 
